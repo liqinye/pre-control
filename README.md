@@ -11,7 +11,7 @@ Instead of merely pushing an attribute _up_ or _down_, we **steer hidden states 
 
 Key ingredients  
 * **Value Function ($V_\phi$)** – predicts final attribute scores from partial generations (trained with TD-λ).  
-* **Gradient Intervention** – edits the last-layer hidden state to minimise $(V_\phi - \tau)^2$ at every step.  
+* **Gradient Intervention** – edits the last-layer hidden state to minimise $(V_\phi(h_t) - \tau)^2$ at every step.  
 * **Multi-attribute support** &nbsp;→ efficient Pareto-frontier exploration and controllable data distillation.
 
 <p align="center">
