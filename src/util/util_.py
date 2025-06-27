@@ -1,66 +1,13 @@
-import os
 import json
 import logging
 import argparse
-from os.path import join as os_join
 from typing import List, Tuple, Union, Dict, Any
 
-from stefutil import SConfig, PathUtil
-from stefutil.os import get_hostname
 from stefutil.prettier import style as s, get_logger, get_logging_handler
-from src.util._paths import BASE_PATH, PROJ_DIR, PKG_NM, DSET_DIR, MODEL_DIR
 
-
-__all__ = [
-    'sconfig', 'pu', 'save_fig',
-    'get_base_path', 'get_hf_cache_dir',
-    'get_device', 'unwrap_model', 'set_seed',
-    'override_std_handler', 'style_transformers_logging', 'model_generation_config2dict',
-    'argparse_str2bool', 'argparse_str2int_list', "argparse_str2float_list",
-    'get_last_layer_output_token_hidden_states'
-]
 
 
 _logger = get_logger(__name__)
-
-
-config_path = os_join(BASE_PATH, PROJ_DIR, PKG_NM, 'util', 'config.json')
-sconfig = SConfig(config_file=config_path).__call__
-pu = PathUtil(
-    base_path=BASE_PATH, project_dir=PROJ_DIR, package_name=PKG_NM, dataset_dir=DSET_DIR, model_dir=MODEL_DIR,
-    within_proj=True#, makedirs='plot'
-)
-save_fig = pu.save_fig
-
-
-def get_base_path() -> str:
-    ret = pu.base_path
-
-    # For remote machines, save heavy-duty models somewhere else to save home disk space
-    hnm = get_hostname()
-    user_nm = os.getlogin()
-    if user_nm == 'yheng6':
-        if 'dmserv2' in hnm:  # DMSERV2; look like too much space have been occupied on other disks
-            ret = os_join('/localscratch', user_nm)
-        elif 'dmserv' in hnm:  # DMSERV
-            ret = os_join('/mnt', '284ac980-b350-4035-8e02-707f671ad89e', user_nm)
-    return ret
-
-
-def get_hf_cache_dir() -> str:
-    if get_base_path() != pu.base_path:  # on server => have access to additional scratch space
-        return os_join(get_base_path(), '.cache', 'huggingface')
-    else:
-        from transformers import TRANSFORMERS_CACHE
-        return TRANSFORMERS_CACHE
-
-
-def get_device(accelerator: 'accelerate.Accelerator' = None):
-    import torch
-    if accelerator:
-        return accelerator.device
-    else:
-        return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def unwrap_model(model: 'torch.nn.Module') -> 'torch.nn.Module':

@@ -1,11 +1,13 @@
 from intervented_model.llama import Intervented_LlamaForCausalLM
+from intervented_model.phi import Intervented_PhiForCausalLM
 import torch
 import argparse
-from datasets import Dataset, load_dataset
+from datasets import load_dataset, DatasetDict
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
 import json
+import datetime
 from tqdm import tqdm
 
 from os.path import join as os_join
@@ -17,7 +19,8 @@ from itertools import chain
 from stefutil.prettier import get_logger, style as s, icecream as sic
 from src.util import argparse_str2bool, argparse_str2int_list, argparse_str2float_list,\
      model_generation_config2dict, get_last_layer_output_token_hidden_states, set_seed
-from src.util.data import helpsteer2_iterative_messages, helpsteer2_prompt2messages
+from src.util.data import helpsteer2_iterative_messages, helpsteer2_prompt2messages, \
+                        ultrafeedback_prompt2messages, ultrafeedback_iterative_messages
 from src.value_function import ValueFunction
 from distutils.util import strtobool
 import torch.distributed as dist
@@ -49,14 +52,17 @@ def run_parallel(
     # Set up multi-process/gpu
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size, timeout=datetime.timedelta(hours=2))
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
 
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side='left', cache_dir=args.hf_cache_dir)
 
-    cls = Intervented_LlamaForCausalLM if args.use_intervention else AutoModelForCausalLM
+    if args.model_name in ["llama-3.2-3b-it", "llama-3.2-1b-it"]:
+        cls = Intervented_LlamaForCausalLM if args.use_intervention else AutoModelForCausalLM
+    elif args.model_name == "phi-4-mini-it":
+        cls = Intervented_PhiForCausalLM if args.use_intervention else AutoModelForCausalLM
     model = cls.from_pretrained(model_name, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16, device_map=device, cache_dir=args.hf_cache_dir)
 
     value_model = ValueFunction(input_dim=args.hidden_dims[0], hidden_dims=args.hidden_dims, num_attributes=5, logger=logger)
@@ -104,6 +110,19 @@ def run_parallel(
             logger.warning(
                 f'Overriding model eos token ID to match tokenizer for open-ended generation: {s.i(generation_config.eos_token_id)} -> {s.i(tokenizer.eos_token_id)}')
         model.generation_config.eos_token_id = tokenizer.eos_token_id
+    elif args.model_name == "phi-4-mini-it":
+        print(generation_config.eos_token_id)
+        assert generation_config.eos_token_id == [200020, 199999]  # using this default 3-token eos token will cause processing errors
+        assert tokenizer.eos_token_id == 199999  # note this is a discrepancy where the tokenizer has a single-token eos token
+        # note without this, processing will not work, cos for some reason,
+        #   llama-3.2 finishes the generation w/ eos token (`<|eot_id|>`),
+        #   but then pad w/ another pad token (`<|end_of_text|`)
+        #   this is cos by default, huggingface::generate will ust the 1st eos token, which is 128001
+        if rank == 0:
+            logger.warning(
+                f'Overriding model eos token ID to match tokenizer for open-ended generation: {s.i(generation_config.eos_token_id)} -> {s.i(tokenizer.eos_token_id)}')
+        tokenizer.eos_token_id = tokenizer.pad_token_id =  200020
+        model.generation_config.eos_token_id = model.generation_config.pad_token_id = 200020
     if rank == 0:
         logger.info(
             f'Generating responses w/ generation config: {s.i(model_generation_config2dict(model.generation_config), indent=1)}')
@@ -116,7 +135,7 @@ def run_parallel(
     local_dataset = dataset.select(range(start, end))
 
     if args.use_intervention:
-        if args.dataset_name == 'HelpSteer2':
+        if args.dataset_name in ['HelpSteer2', "CodeUltraFeedback"]:
             def collator(batch: List[Dict[str, Any]]):
                 return dict(
                     prompt_messages=[msg['prompt_messages'] for msg in batch],
@@ -125,7 +144,7 @@ def run_parallel(
         else:
             raise NotImplementedError
     else:
-        if args.dataset_name == 'HelpSteer2':
+        if args.dataset_name in ['HelpSteer2', "CodeUltraFeedback"]:
             def collator(batch: List[Dict[str, Any]]):
                 return dict(
                     prompt_messages=[msg['prompt_messages'] for msg in batch]
@@ -157,7 +176,6 @@ def run_parallel(
         if args.use_intervention:
             model.edit_target = args.target
             model.target_score = target_score
-            model.trajectory = args.trajectory
             model.rank = rank
             model.sequence_unfinished_flag = torch.ones(batch_size, dtype=torch.bool, device=model.device)  # reset the flag each time for a new batch
             model.original_hidden_states = []  # reset for each batch
@@ -227,9 +245,9 @@ def run_parallel(
                 f.write(json.dumps(res, ensure_ascii=False) + '\n')
 
         if args.use_intervention:
-            torch.save(all_vf,  os_join(output_path, "vf_outputs_after.pt"))
+            torch.save(all_vf,  os_join(output_path, "vf_outputs_after.pth"))
         else:
-            torch.save(all_vf,  os_join(output_path, "vf_outputs.pt"))
+            torch.save(all_vf,  os_join(output_path, "vf_outputs.pth"))
 
 def exclude_target_sample(target, pre_inference_path):
     unint_score = torch.load(os_join(pre_inference_path, "responses_scores.pth"))
@@ -259,7 +277,6 @@ def main():
     parser.add_argument('--output_postfix', type=str, help='Postfix for the output files')
     parser.add_argument('--hf_cache_dir', type=str, help='Huggingface cache directory')
     parser.add_argument('--target', type=argparse_str2int_list, default="[3,3,3,2,2]")
-    parser.add_argument('--trajectory', type=lambda x: bool(strtobool(x)), default=False)
     parser.add_argument('--temp', type=float, default=0.6)
     parser.add_argument('--num_processes', type=int, default=8)
     parser.add_argument('--pre_inference_path', type=str, default="", help="Path for previous generate response")
@@ -276,19 +293,25 @@ def main():
     model_name_map = {
         'llama-3.2-1b-it': 'meta-llama/Llama-3.2-1B-Instruct',
         'llama-3.2-3b-it': 'meta-llama/Llama-3.2-3B-Instruct',
+        'phi-4-mini-it': "microsoft/Phi-4-mini-instruct"
     }
     model_name = model_name_map[args.model_name]
     sic(model_name)
         
     logger.info(f'Using target attribute scores for intervention: {s.i(args.target)}')
-
-    dataset = load_dataset("nvidia/HelpSteer2", cache_dir=args.hf_cache_dir, split='validation')
-    # as discussed in `get_activations_only.py`,
-    #   take the even rows as prompts since each prompt is duplicated 2X for 2 responses
-    prompts = dataset['prompt']
-    assert prompts[::2] == prompts[1::2]  # sanity check
-    dataset = dataset.select(list(range(0, len(prompts), 2)))
-    logger.info(f'Generating responses on {s.i(len(dataset))} prompts...')
+    if args.dataset_name == 'HelpSteer2':
+        dataset = load_dataset("nvidia/HelpSteer2", cache_dir=args.hf_cache_dir, split='validation')
+        # as discussed in `get_activations_only.py`,
+        #   take the even rows as prompts since each prompt is duplicated 2X for 2 responses
+        prompts = dataset['prompt']
+        assert prompts[::2] == prompts[1::2]  # sanity check
+        dataset = dataset.select(list(range(0, len(prompts), 2)))
+        logger.info(f'Generating responses on {s.i(len(dataset))} prompts...')
+    elif args.dataset_name == "CodeUltraFeedback":
+        dset: datasets.DatasetDict = load_dataset("coseal/CodeUltraFeedback", cache_dir=args.hf_cache_dir)
+        
+        splits= dset['train'].train_test_split(test_size=0.1, seed=args.seed)
+        dataset = splits["test"]
 
     if args.use_intervention:
         inter_indices = exclude_target_sample(args.target, args.pre_inference_path)
@@ -298,13 +321,17 @@ def main():
         
         dataset = dataset.select(inter_indices)
 
-    dataset = dataset.select(range(64))
-
     def preprocessing(example):
         if args.iteration == 0:
-            example['prompt_messages'] = helpsteer2_prompt2messages(example['prompt'])
+            if args.dataset_name == "HelpSteer2":
+                example['prompt_messages'] = helpsteer2_prompt2messages(example['prompt'])
+            elif args.dataset_name == "CodeUltraFeedback":
+                example['prompt_messages'] = ultrafeedback_prompt2messages(example['instruction'])
         else:
-            example['prompt_messages'] = helpsteer2_iterative_messages(example['prompt'], example['response'])
+            if args.dataset_name == "HelpSteer2":
+                example['prompt_messages'] = helpsteer2_iterative_messages(example['prompt'], example['response'])
+            elif args.dataset_name == "CodeUltraFeedback":
+                example['prompt_messages'] = ultrafeedback_iterative_messages(example['instruction'], example['response'])
         return example
 
     # Load the dataset first

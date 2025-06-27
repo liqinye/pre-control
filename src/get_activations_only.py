@@ -1,20 +1,23 @@
-import torch
-import torch.nn.functional as F
 import argparse
 import random
 import time
+import datetime
+import os
+import json
+import torch
+import torch.nn.functional as F
 
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
-import os
+
 from os.path import join as os_join
 from tqdm import tqdm
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 from torch.distributed import all_gather_object
 from torch.utils.data import Dataset, Sampler
 from itertools import chain
-import json
 
 import logging
 from typing import List, Dict, Any
@@ -22,7 +25,7 @@ from typing import Iterator
 
 from stefutil.prettier import get_logger, style as s, icecream as sic
 from src.util import set_seed, style_transformers_logging, model_generation_config2dict, get_last_layer_output_token_hidden_states
-from src.util.data import helpsteer2_prompt2messages
+from src.util.data import helpsteer2_prompt2messages, ultrafeedback_prompt2messages
 
 
 
@@ -143,20 +146,25 @@ def get_llm_activations(
         assert tokenizer.pad_token is not None and tokenizer.pad_token_id is not None
         assert generation_config.pad_token_id is None
         generation_config.pad_token_id = tokenizer.eos_token_id
+    elif model_name == "phi-4-mini-it":
+        assert generation_config.eos_token_id == [200020, 199999]
+        assert generation_config.pad_token_id == 199999
+        generation_config.eos_token_id = tokenizer.eos_token_id = 200020
+        generation_config.pad_token_id = tokenizer.pad_token_id = 200020
 
     generation_config.do_sample = True if num_samples > 1 else False
     logger.info(f"Generating do_sample: {generation_config.do_sample}")
-    if model_name in ["llama-3.2-1b-it", "llama-3.2-3b-it"]:
-        if generation_config.do_sample:
-            set_seed(seed)
-            generation_config.temperature = temperature
-            generation_config.top_k = None
-            generation_config.top_p = 1.0
-            generation_config.num_return_sequences = num_samples
-        else:
-            generation_config.temperature = None
-            generation_config.top_k = None
-            generation_config.top_p = None
+    # if model_name in ["llama-3.2-1b-it", "llama-3.2-3b-it"]:
+    if generation_config.do_sample:
+        set_seed(seed)
+        generation_config.temperature = temperature
+        generation_config.top_k = None
+        generation_config.top_p = 1.0
+        generation_config.num_return_sequences = num_samples
+    else:
+        generation_config.temperature = None
+        generation_config.top_k = None
+        generation_config.top_p = None
 
     gen_args['generation_config'] = generation_config
     logger.info(f'Generating responses w/ generation config: {s.i(model_generation_config2dict(generation_config), indent=1)}')
@@ -206,6 +214,14 @@ def get_llm_activations(
             padding_length = pad_len_all - length_of_prompts_padding
 
             n_finish += (padding_length.size(0) - (padding_length == 0).sum()).item()
+        elif model_name == 'phi-4-mini-it':
+            assert tokenizer.pad_token_id == tokenizer.eos_token_id == 200020 # sanity check
+
+            pad_id = tokenizer.pad_token_id
+            length_of_prompts_padding = (input_ids == pad_id).sum(dim=1)
+            pad_len_all = (outputs.sequences == pad_id).sum(dim=1)
+            padding_length = pad_len_all - length_of_prompts_padding
+            n_finish += (padding_length.size(0) - (padding_length == 0).sum()).item()
         else:
             raise NotImplementedError
 
@@ -235,7 +251,10 @@ def get_llm_activations(
         stacked = F.pad(stacked, (0, 0, 0, 0, 0, max_length - stacked.shape[0])).transpose(0, 1)
         padded_hiddens.append(stacked)
     local_hidden_activations = torch.cat(padded_hiddens, dim=0)
+    local_hidden_activations = local_hidden_activations.detach().cpu()
+
     
+    torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
 
     world_size = accelerator.num_processes
@@ -243,8 +262,9 @@ def get_llm_activations(
     gathered_responses = [None] * world_size
     all_gather_object(gathered_responses, local_responses)
 
+    gloo_group = torch.distributed.new_group(backend="gloo")
     gathered_hidden = [None] * world_size
-    all_gather_object(gathered_hidden, local_hidden_activations)
+    all_gather_object(gathered_hidden, local_hidden_activations, group=gloo_group)
 
     gathered_masks = [None] * world_size
     all_gather_object(gathered_masks, mask)
@@ -254,14 +274,13 @@ def get_llm_activations(
     all_masks     = torch.cat(gathered_masks, dim=0)
 
     if accelerator.is_main_process:
-        print(all_hidden.size())
-        print(all_masks.size())
         torch.save(all_hidden, os_join(base_output_path, f'token_wise_activations_{mode}.pth'))
         time.sleep(1)
         torch.save(all_masks, os_join(base_output_path, f'mask_{mode}.pth'))
         time.sleep(1)
-        with open(os_join(base_output_path, f'response_{mode}.json'), 'w') as f:
-            json.dump(all_responses, f, ensure_ascii=False)
+        with open(os_join(base_output_path, f'response_{mode}.jsonl'), 'w') as f:
+            for res in all_responses:
+                f.write(json.dumps(res, ensure_ascii=False) + '\n')
 
 
 def main():
@@ -298,6 +317,7 @@ def main():
     model_name_map = {
         'llama-3.2-1b-it': 'meta-llama/Llama-3.2-1B-Instruct',
         'llama-3.2-3b-it': 'meta-llama/Llama-3.2-3B-Instruct',
+        'phi-4-mini-it': "microsoft/Phi-4-mini-instruct"
     }
     model_name = model_name_map[args.model_name]
 
@@ -326,10 +346,12 @@ def main():
             assert dataset.select(range(0, n, 2))["prompt"] == dataset.select(range(1, n, 2))["prompt"]
             # take the even rows as prompts since each prompt is duplicated 2X for 2 responses
             dset[split] = dataset.select(range(0, len(dataset), 2))
-            #=================
-            dset[split] = dset[split].select(range(64))
-            #=================
         dataset = dset
+    elif args.dataset_name == 'CodeUltraFeedback':
+        dset: datasets.DatasetDict = load_dataset("coseal/CodeUltraFeedback", cache_dir=cache_dir)
+        
+        splits= dset['train'].train_test_split(test_size=0.1, seed=args.seed)
+        dataset = DatasetDict({"train": splits["train"], "validation": splits["test"]})
     else:
         raise NotImplementedError
 
@@ -343,13 +365,22 @@ def main():
             example['attention_mask'] = [1] * len(tokenized)
 
             return example
+        elif args.dataset_name == 'CodeUltraFeedback':
+            example['prompt_messages'] = ultrafeedback_prompt2messages(example["instruction"])
+
+            example['input_ids'] = tokenized = tokenizer.apply_chat_template(example['prompt_messages'], add_generation_prompt=True)
+            example['attention_mask'] = [1] * len(tokenized)
+
+            return example
         else:
             raise NotImplementedError
 
     dataset = dataset.map(tokenize, batched=False)
-    n_multi_turn = {split: sum(1 for sample in dset if sample["multi-turn"]) for split, dset in dataset.items()}
-    logger.info(f'#multi-turn conversations : {s.i(n_multi_turn, indent=True)}')
-    # Filter for tokens within 512 limit
+    if args.dataset_name == 'HelpSteer2':
+        n_multi_turn = {split: sum(1 for sample in dset if sample["multi-turn"]) for split, dset in dataset.items()}
+        logger.info(f'#multi-turn conversations : {s.i(n_multi_turn, indent=True)}')
+
+    # Filter for tokens within 2048 limit
     # TODO: why this filtering?
     #   => count the number of samples dropped for filtering
     n_tr, n_ts = (len(dset) for dset in dataset.values())
@@ -360,7 +391,8 @@ def main():
 
     data_collator = DataCollatorReward(tokenizer=tokenizer)
 
-    accelerator = Accelerator()
+    kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(hours=2))
+    accelerator = Accelerator(kwargs_handlers=[kwargs])
 
     train_sampler = UnevenDistributedSampler(dataset["train"], shuffle=False, seed=42, num_replicas=accelerator.num_processes, rank=accelerator.process_index)
     test_sampler = UnevenDistributedSampler(dataset["validation"], shuffle=False, seed=42, num_replicas=accelerator.num_processes, rank=accelerator.process_index)

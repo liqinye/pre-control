@@ -81,8 +81,6 @@ class Trainer:
             dataloader = self.test_dataloader
         total_loss = 0
         count_batches = 0
-        total_loss_each = torch.zeros(5).to(self.device)
-        total_final = 0
         
         for batch_input in dataloader:
             if mode == 'train':
@@ -214,7 +212,7 @@ class TensorDataset(Dataset):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='Llama-3.2-1B')
-    parser.add_argument('--dataset_name', type=str, default='nvidia/HelpSteer2')
+    parser.add_argument('--dataset_name', type=str, default='HelpSteer2')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--hidden_dims', type=argparse_str2int_list, help='JSON list of hidden dimensions', default='[2048]')
@@ -239,11 +237,10 @@ def main():
     )
     args = parser.parse_args()
 
-    dset_map = {'nvidia/HelpSteer2': 'hs2'}
+    dset_map = {'HelpSteer2': 'hs2', 'CodeUltraFeedback': 'code-uf'}
     d_md = dict(md=args.model_name, dset=dset_map[args.dataset_name])
-    d_tr = {'#l':len(args.hidden_dims)+1, 'lr':f'{args.lr:.1e}', 'bsz':args.batch_size, "temp":args.temperature, "lambda":args.lambda_param}
-    date = now(fmt='short-date')
-    model_dir_nm = f'{date}_Value-Func-{s.pa(d_md)}_{s.pa(d_tr)}'
+    d_tr = {'lr':f'{args.lr:.1e}', 'bsz':args.batch_size, "lambda":args.lambda_param}
+    model_dir_nm = f'vf-{s.pa(d_md)}_{s.pa(d_tr)}'
     model_output_path = os_join(args.model_output_dir, model_dir_nm)
 
     os.makedirs(model_output_path, exist_ok=True)
@@ -254,7 +251,7 @@ def main():
 
     set_seed(args.seed)
 
-    if args.model_name == "llama-3.2-3b-it":
+    if args.model_name in ["llama-3.2-3b-it", "phi-4-mini-it"]:
         value_model = ValueFunction(input_dim=3072, hidden_dims=args.hidden_dims, num_attributes=5, logger=logger)
     elif args.model_name == "llama-3.2-1b-it":
         value_model = ValueFunction(input_dim=2048, hidden_dims=args.hidden_dims, num_attributes=5, logger=logger)

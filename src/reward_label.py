@@ -44,14 +44,17 @@ def data_collator(data, iteration):
         ret.append(prompt + [dict(role='assistant', content=response)])
     return ret
 
-def get_rm(data, rm_model, tokenizer):
+def get_rm(data, rm_model, tokenizer, dataset):
     messages = data
     inputs = tokenizer.apply_chat_template(messages, padding=True, return_tensors="pt", return_dict=True).to(unwrap_model(rm_model).device)
     with torch.no_grad():
         rm_out = rm_model(**inputs)
 
     # total 19 attributes; first 5 are for helpsteer2; map back to 5-point scale
-    rm_vals = rm_out.rewards[:, :5] * 5 - 0.5  # shape: [batch_size, num_attributes]
+    if dataset == "HelpSteer2":
+        rm_vals = rm_out.rewards[:, :5] * 5 - 0.5  # shape: [batch_size, num_attributes]
+    elif dataset == "CodeUltraFeedback":
+        rm_vals = rm_out.rewards[:, -5:] * 5 - 0.5
 
     return rm_vals
 
@@ -69,6 +72,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for Reward Model inference')
     parser.add_argument('--hf_cache_dir', type=str, help='Huggingface cache directory')
     parser.add_argument('--iteration', type=int, default=0)
+    parser.add_argument('--dataset_name', type=str, default="HelpSteer2")
 
     args = parser.parse_args()
 
@@ -123,7 +127,7 @@ def main():
     rm_scores = []
 
     for i, data in enumerate(tqdm(data_loader, desc='Getting reward labels')):
-        rm_score = get_rm(data, reward_model, tokenizer)
+        rm_score = get_rm(data, reward_model, tokenizer, args.dataset_name)
         rm_scores.append(rm_score)
 
     rm_scores = torch.cat(rm_scores, dim=0)

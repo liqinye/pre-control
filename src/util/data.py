@@ -100,3 +100,13 @@ def helpsteer2_iterative_messages(prompt, response: str) -> List[Dict[str, str]]
     messages += [dict(role='assistant', content=response)]
     messages += [dict(role="user", content=f"Based on the conversation above, please re-address the following question. Begin immediately with the answer content.\n{ppt}")]
     return messages
+
+def ultrafeedback_prompt2messages(prompt: str) -> List[Dict[str, str]]:
+    messages = [dict(role='user', content=prompt)]
+    return messages
+
+def ultrafeedback_iterative_messages(prompt, response:str) -> List[Dict[str, str]]:
+    messages = [dict(role='user', content=prompt)]
+    messages += [dict(role='assistant', content=response)]
+    messages += [dict(role="user", content=f"Based on the conversation above, please re-address the following question. Begin immediately with the answer content.\n{prompt}")]
+    return messages
