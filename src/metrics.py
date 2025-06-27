@@ -34,7 +34,7 @@ def self_bleu(responses, weights=(0.25,0.25,0.25,0.25)):
 
 def l1_distance(score, target):
     target = torch.tensor(target).repeat(score.size(0), 1)
-    return torch.norm(score-target.float(), p=1, dim=1).mean()
+    return torch.norm(score-target.float(), p=1, dim=1).mean().item()
 
 def success_rate(score, target):
     score_int = score.round().clip(0,4).int()
@@ -46,16 +46,19 @@ def success_rate(score, target):
 def get_metric(
         llm,
         ds,
+        lr,
+        ns,
         target,
         vf,
         iteration,
 ):
-    intervene_path = f"./data/inference_intervention/Inference-Result_{{md={llm},ds={ds}}}-ns=1-train_temp=0.0/infer_temp=0.0/{vf}/edited_{{tgt={target}}}/iteration={iteration}"
+    intervene_path = f"./data/inference_intervention/Inference-Result_{{md={llm},ds={ds}}}-ns=1-train_temp=0.0/infer_temp=0.0/{vf}/{{lr={lr},#s={ns}}}/edited_{{tgt={target}}}/iteration={iteration}"
 
-    score = torch.load(os_join(intervene_path, "responses_score.pth"))
+    score = torch.load(os_join(intervene_path, "responses_scores.pth"), map_location="cpu")
 
     with open(os_join(intervene_path, "responses.jsonl"), "r") as f:
         responses = [json.loads(line) for line in f]
+        responses = [res['response'] for res in responses]
 
     target = argparse_str2int_list(target)
     diversity = self_bleu(responses)
@@ -66,11 +69,14 @@ def get_metric(
 
 if __name__ == "__main__":
     args = {
-        llm = "phi-4-mini",
-        ds = "code-uf",
-        target = "[3,3,3,3,3]",
-        vf = "vf-{md=phi-4-mini-it,dset=code-uf}_{lr=1.0e-04,bsz=32,lambda=0.9}",
-        iteration = 0
+        "llm": "phi-4-mini-it",
+        "ds": "code-uf",
+        "lr": "5e-2",
+        "ns": 1000,
+        "target": "[3,3,3,3,3]",
+        "vf": "vf-{md=phi-4-mini-it,dset=code-uf}_{lr=1.0e-04,bsz=32,lambda=0.9}",
+        "iteration": 0
     }
 
     diversity, distance, succ_rate = get_metric(**args)
+    print(diversity, distance, succ_rate)
