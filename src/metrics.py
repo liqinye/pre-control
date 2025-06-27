@@ -79,4 +79,3 @@ if __name__ == "__main__":
     }
 
     diversity, distance, succ_rate = get_metric(**args)
-    print(diversity, distance, succ_rate)
